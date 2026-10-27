@@ -13,8 +13,8 @@ ser fiable:
   similitud se elige con las demás entidades, sin ver la evaluada. Es la cifra
   que estima el rendimiento con entidades nuevas; la de la configuración
   ajustada con estos mismos datos es optimista.
-- Comparación con líneas base (marcar todo, solo reglas) y efecto de cada
-  parámetro por separado.
+- Comparación con líneas base (marcar todo, solo reglas, Isolation Forest
+  por sí solo) y efecto de cada parámetro por separado.
 - Medidas complementarias, que responden a otra pregunta y no sustituyen a
   la medida por compra: detección por entidad y sensibilidad sobre compras de
   entidades con más de una compra.
@@ -30,12 +30,20 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import IsolationForest
 from sklearn.metrics import balanced_accuracy_score, matthews_corrcoef, roc_auc_score
+from sklearn.preprocessing import StandardScaler
 
 from evaluar_dataset import _es_resumen, _leer, normalizar_y_emparejar_columnas, puntuar
 
 OPCIONES_SIMILITUD = (0.45, 0.50, 0.55, 0.60, 0.65, 0.70)
 SIMILITUD_POR_DEFECTO = 0.50
+# Variables estructurales y estadísticas del modelo base: sin similitud
+# semántica ni puntaje de reglas.
+VARIABLES_IF_BASE = (
+    "monto_referencial", "ratio_monto_8uit", "monto_acumulado_30d",
+    "frecuencia_compras_30d", "dias_desde_compra_anterior",
+)
 
 
 def metricas(y: np.ndarray, decision: np.ndarray, puntaje: np.ndarray) -> dict:
@@ -87,6 +95,24 @@ def intervalo_95(
     return tuple(float(v) for v in np.percentile(valores, [2.5, 97.5]))
 
 
+def isolation_forest_solo(
+    caracteristicas: pd.DataFrame, contaminacion: float, random_state: int = 42
+) -> tuple[np.ndarray, np.ndarray]:
+    """Línea base: Isolation Forest por sí solo, sin NLP ni reglas.
+
+    Marca como fraccionamiento lo que el bosque considera atípico; el puntaje
+    (mayor = más atípico) sirve para el ROC-AUC. La contaminación se fija de
+    antemano, igual que en el sistema, para no ajustarla con la etiqueta.
+    """
+    montos = ["monto_referencial", "ratio_monto_8uit", "monto_acumulado_30d"]
+    X = caracteristicas[list(VARIABLES_IF_BASE)].astype(float).fillna(0.0)
+    X[montos] = np.log1p(X[montos].clip(lower=0.0))
+    X["dias_desde_compra_anterior"] = X["dias_desde_compra_anterior"].clip(upper=365.0)
+    X = StandardScaler().fit_transform(X.to_numpy())
+    iso = IsolationForest(n_estimators=100, contamination=contaminacion, random_state=random_state).fit(X)
+    return iso.predict(X) == -1, -iso.decision_function(X)
+
+
 def validacion_anidada(
     y: np.ndarray,
     entidades: np.ndarray,
@@ -127,12 +153,18 @@ def comparar(
     similitud: float,
     umbral: float,
     repeticiones: int = 2000,
+    isolation_forest: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[pd.DataFrame, dict[float, int]]:
     """Tabla comparativa: líneas base, configuración elegida y validación anidada."""
     anidada, puntaje_anidado, elegidas = validacion_anidada(y, entidades, puntajes, umbral)
     candidatos = [
         ("Marcar todo como fraccionamiento", np.ones(len(y), bool), np.ones(len(y)), False),
         ("Solo reglas normativas", reglas >= umbral, reglas, True),
+    ]
+    if isolation_forest is not None:
+        candidatos.append(("Isolation Forest solo (estructurales y estadísticas, sin NLP)",
+                           *isolation_forest, True))
+    candidatos += [
         (f"Híbrido, similitud {SIMILITUD_POR_DEFECTO:.2f} (por defecto)",
          puntajes[SIMILITUD_POR_DEFECTO] >= umbral, puntajes[SIMILITUD_POR_DEFECTO], True),
         (f"Híbrido, similitud {similitud:.2f} (ajustada a esta muestra)",
@@ -295,7 +327,9 @@ def main(argv=None) -> int:
         "ventana": args.ventana, "similitud": args.similitud, "umbral": args.umbral,
         "contaminacion": args.contaminacion, "repeticiones_ic": args.repeticiones,
     }])
-    comparacion, elegidas = comparar(y, entidades, puntajes, reglas, args.similitud, args.umbral, args.repeticiones)
+    iso_solo = isolation_forest_solo(resultados[SIMILITUD_POR_DEFECTO], args.contaminacion)
+    comparacion, elegidas = comparar(
+        y, entidades, puntajes, reglas, args.similitud, args.umbral, args.repeticiones, iso_solo)
     tabla_triaje = triaje(y, puntajes[args.similitud], args.umbral)
     composicion = composicion_etiqueta(y, entidades)
     tabla_entidad = por_entidad(y, entidades, puntajes[args.similitud], args.umbral)

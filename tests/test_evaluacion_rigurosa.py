@@ -1,11 +1,14 @@
 import unittest
 
 import numpy as np
+import pandas as pd
 
 from evaluacion_rigurosa import (
+    VARIABLES_IF_BASE,
     composicion_etiqueta,
     con_contexto,
     intervalo_95,
+    isolation_forest_solo,
     metricas,
     por_entidad,
     triaje,
@@ -69,6 +72,19 @@ class EvaluacionRigurosaTest(unittest.TestCase):
         self.assertEqual((multiples["fraccionamientos"], multiples["detectados_alto"],
                           multiples["alto_o_pendiente"]), (2, 1, 2))
         self.assertEqual(contexto.loc["Entidades con una sola compra", "detectados_alto"], 0)
+
+    def test_isolation_forest_solo_marca_lo_atipico_sin_nlp(self):
+        # 19 compras parecidas y una muy distinta en todas las variables; la
+        # similitud semántica no debe influir en la decisión.
+        rng = np.random.default_rng(0)
+        datos = pd.DataFrame({c: rng.normal(100, 5, 20) for c in VARIABLES_IF_BASE})
+        datos.loc[19, list(VARIABLES_IF_BASE)] = 5000
+        datos["max_similitud_nlp"] = 1.0
+        decision, puntaje = isolation_forest_solo(datos, contaminacion=0.05)
+        self.assertEqual(np.flatnonzero(decision).tolist(), [19])
+        self.assertEqual(int(np.argmax(puntaje)), 19)
+        datos["max_similitud_nlp"] = 0.0
+        self.assertEqual(isolation_forest_solo(datos, 0.05)[0].tolist(), decision.tolist())
 
     def test_triaje_reparte_todos_los_casos(self):
         y = np.array([1, 1, 0, 0, 1])
