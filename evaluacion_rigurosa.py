@@ -3,6 +3,7 @@
 Uso:
     python evaluacion_rigurosa.py "Dataset_Contraloria (1).xlsx"
     python evaluacion_rigurosa.py datos.xlsx --similitud 0.60 --salida evaluacion.xlsx
+    python evaluacion_rigurosa.py datos.xlsx --referencia CONOSCE_1.xlsx CONOSCE_2.xlsx
 
 Complementa a ``evaluar_dataset.py`` con lo que una evaluación necesita para
 ser fiable:
@@ -14,7 +15,9 @@ ser fiable:
   que estima el rendimiento con entidades nuevas; la de la configuración
   ajustada con estos mismos datos es optimista.
 - Comparación con líneas base (marcar todo, solo reglas, Isolation Forest
-  por sí solo) y efecto de cada parámetro por separado.
+  por sí solo) y efecto de cada parámetro por separado. Con ``--referencia``
+  se agrega el Isolation Forest entrenado con compras de referencia sin
+  etiqueta (p. ej., CONOSCE) y aplicado a este archivo sin reentrenarse.
 - Medidas complementarias, que responden a otra pregunta y no sustituyen a
   la medida por compra: detección por entidad y sensibilidad sobre compras de
   entidades con más de una compra.
@@ -30,20 +33,19 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
 from sklearn.metrics import balanced_accuracy_score, matthews_corrcoef, roc_auc_score
-from sklearn.preprocessing import StandardScaler
 
 from evaluar_dataset import _es_resumen, _leer, normalizar_y_emparejar_columnas, puntuar
+from modulos_ia.modelo_aislamiento import (
+    VARIABLES_IF_SOLO as VARIABLES_IF_BASE,
+    ajustar_isolation_forest_solo,
+    entrenar_isolation_forest_referencia,
+    variables_isolation_forest_solo as variables_if_base,
+)
+from utilidades.gestor_modelo_referencia import preparar_referencia
 
 OPCIONES_SIMILITUD = (0.45, 0.50, 0.55, 0.60, 0.65, 0.70)
 SIMILITUD_POR_DEFECTO = 0.50
-# Variables estructurales y estadísticas del modelo base: sin similitud
-# semántica ni puntaje de reglas.
-VARIABLES_IF_BASE = (
-    "monto_referencial", "ratio_monto_8uit", "monto_acumulado_30d",
-    "frecuencia_compras_30d", "dias_desde_compra_anterior",
-)
 
 
 def metricas(y: np.ndarray, decision: np.ndarray, puntaje: np.ndarray) -> dict:
@@ -96,21 +98,29 @@ def intervalo_95(
 
 
 def isolation_forest_solo(
-    caracteristicas: pd.DataFrame, contaminacion: float, random_state: int = 42
+    datos: pd.DataFrame, contaminacion: float, random_state: int = 42, referencia: pd.DataFrame | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Línea base: Isolation Forest por sí solo, sin NLP ni reglas.
+    """Modelo A: Isolation Forest por sí solo, sin NLP, reglas ni recurrencia.
 
-    Marca como fraccionamiento lo que el bosque considera atípico; el puntaje
-    (mayor = más atípico) sirve para el ROC-AUC. La contaminación se fija de
-    antemano, igual que en el sistema, para no ajustarla con la etiqueta.
+    Es el mismo cálculo que la app usa al procesar con el modelo A. Recibe el
+    archivo tal como se cargó (no la salida del extractor). Marca como
+    fraccionamiento lo que el bosque considera atípico; el puntaje (mayor =
+    más atípico) sirve para el ROC-AUC. La contaminación se fija de antemano,
+    igual que en el sistema, para no ajustarla con la etiqueta.
+
+    Con ``referencia`` el bosque se entrena con esas compras (sin etiqueta) y
+    solo puntúa ``datos``; sin ella, se entrena con el propio archivo.
     """
-    montos = ["monto_referencial", "ratio_monto_8uit", "monto_acumulado_30d"]
-    X = caracteristicas[list(VARIABLES_IF_BASE)].astype(float).fillna(0.0)
-    X[montos] = np.log1p(X[montos].clip(lower=0.0))
-    X["dias_desde_compra_anterior"] = X["dias_desde_compra_anterior"].clip(upper=365.0)
-    X = StandardScaler().fit_transform(X.to_numpy())
-    iso = IsolationForest(n_estimators=100, contamination=contaminacion, random_state=random_state).fit(X)
-    return iso.predict(X) == -1, -iso.decision_function(X)
+    modelo = (None if referencia is None
+              else entrenar_isolation_forest_referencia(referencia, contaminacion, random_state))
+    return ajustar_isolation_forest_solo(datos, contaminacion, random_state, modelo)
+
+
+def mismas_alertas(puntaje: np.ndarray, alertas: int) -> np.ndarray:
+    """Marca las ``alertas`` compras de mayor puntaje (empates: la primera en el archivo)."""
+    decision = np.zeros(len(puntaje), dtype=bool)
+    decision[np.argsort(-np.asarray(puntaje, dtype=float), kind="stable")[:alertas]] = True
+    return decision
 
 
 def validacion_anidada(
@@ -153,17 +163,26 @@ def comparar(
     similitud: float,
     umbral: float,
     repeticiones: int = 2000,
-    isolation_forest: tuple[np.ndarray, np.ndarray] | None = None,
+    isolation_forest: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[pd.DataFrame, dict[float, int]]:
-    """Tabla comparativa: líneas base, configuración elegida y validación anidada."""
+    """Tabla comparativa: líneas base, configuración elegida y validación anidada.
+
+    ``isolation_forest`` asocia a cada variante del modelo A (p. ej.,
+    "entrenado con este archivo") su decisión y su puntaje.
+    """
     anidada, puntaje_anidado, elegidas = validacion_anidada(y, entidades, puntajes, umbral)
     candidatos = [
         ("Marcar todo como fraccionamiento", np.ones(len(y), bool), np.ones(len(y)), False),
         ("Solo reglas normativas", reglas >= umbral, reglas, True),
     ]
-    if isolation_forest is not None:
-        candidatos.append(("Isolation Forest solo (estructurales y estadísticas, sin NLP)",
-                           *isolation_forest, True))
+    # Con su contaminación el bosque solo puede marcar unos pocos casos; con
+    # el mismo número de alertas que el híbrido se comparan en igualdad.
+    alertas = int((puntajes[similitud] >= umbral).sum())
+    for variante, (decision_if, puntaje_if) in (isolation_forest or {}).items():
+        candidatos.append((f"Isolation Forest solo, {variante}", decision_if, puntaje_if, True))
+        candidatos.append((f"Isolation Forest solo, {variante}, mismas alertas que el híbrido "
+                           f"{similitud:.2f} ({alertas})",
+                           mismas_alertas(puntaje_if, alertas), puntaje_if, True))
     candidatos += [
         (f"Híbrido, similitud {SIMILITUD_POR_DEFECTO:.2f} (por defecto)",
          puntajes[SIMILITUD_POR_DEFECTO] >= umbral, puntajes[SIMILITUD_POR_DEFECTO], True),
@@ -298,11 +317,14 @@ def main(argv=None) -> int:
     parser.add_argument("--uit", type=float, default=5150.0, help="UIT para años sin valor oficial (5150)")
     parser.add_argument("--repeticiones", type=int, default=2000, help="Remuestreos para los intervalos (2000)")
     parser.add_argument("--salida", type=Path, help="Excel donde guardar las tablas")
+    parser.add_argument("--referencia", type=Path, nargs="+",
+                        help="Excel o CSV sin etiqueta (p. ej., CONOSCE) para entrenar el Isolation Forest solo")
     args = parser.parse_args(argv)
 
-    if not args.archivo.exists():
-        print(f"No existe el archivo: {args.archivo}", file=sys.stderr)
-        return 1
+    for ruta in (args.archivo, *(args.referencia or ())):
+        if not ruta.exists():
+            print(f"No existe el archivo: {ruta}", file=sys.stderr)
+            return 1
     opciones = tuple(sorted(set(OPCIONES_SIMILITUD) | {args.similitud}))
 
     datos = normalizar_y_emparejar_columnas(_leer(args.archivo))
@@ -327,9 +349,14 @@ def main(argv=None) -> int:
         "ventana": args.ventana, "similitud": args.similitud, "umbral": args.umbral,
         "contaminacion": args.contaminacion, "repeticiones_ic": args.repeticiones,
     }])
-    iso_solo = isolation_forest_solo(resultados[SIMILITUD_POR_DEFECTO], args.contaminacion)
+    variantes_if = {"entrenado con este archivo": isolation_forest_solo(datos, args.contaminacion)}
+    if args.referencia:
+        referencia = preparar_referencia([_leer(r) for r in args.referencia])
+        resumen["compras_referencia_if"] = len(referencia)
+        variantes_if[f"entrenado con referencia ({len(referencia):,} compras)"] = isolation_forest_solo(
+            datos, args.contaminacion, referencia=referencia)
     comparacion, elegidas = comparar(
-        y, entidades, puntajes, reglas, args.similitud, args.umbral, args.repeticiones, iso_solo)
+        y, entidades, puntajes, reglas, args.similitud, args.umbral, args.repeticiones, variantes_if)
     tabla_triaje = triaje(y, puntajes[args.similitud], args.umbral)
     composicion = composicion_etiqueta(y, entidades)
     tabla_entidad = por_entidad(y, entidades, puntajes[args.similitud], args.umbral)

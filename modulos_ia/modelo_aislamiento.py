@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
+from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 UMBRAL_ALTO = 71.0
@@ -91,6 +92,128 @@ def ejecutar_modelo_aislamiento_hibrido(
     df['nivel_riesgo'] = np.select(conds, ['Alto', 'Medio', 'Bajo'], default='Bajo')
     df['es_anomalia'] = (df['puntaje_riesgo'] >= UMBRAL_ALTO).astype(int)
 
+    return procesar_estado_revision(df, modo_automatico=modo_automatico)
+
+
+# --- Modelo A: Isolation Forest por sí solo -----------------------------------
+# Variables estructurales y estadísticas calculadas desde el archivo, sin el
+# extractor del sistema: allí la frecuencia, los acumulados y los días entre
+# compras agrupan las compras por similitud de texto o mismo CUBSO dentro de
+# una ventana, es decir, ya contienen el análisis semántico y de recurrencia
+# del sistema completo. Tampoco se usa el umbral de 8 UIT, base de las reglas.
+VARIABLES_IF_SOLO = (
+    "log_monto",               # estructural: tamaño de la compra
+    "log_compras_entidad",     # estadística: compras de la entidad en el archivo
+    "log_monto_total_entidad", # estadística: gasto total de la entidad en el archivo
+    "z_monto_entidad",         # estadística: cuán atípico es el monto dentro de su entidad
+)
+EXPLICACION_IF_SOLO = (
+    "Modelo A (Isolation Forest solo, {origen}): compra {estado} (atipicidad {atipicidad:+.3f}) "
+    "según su monto, las compras y el gasto total de la entidad y el monto frente "
+    "a su entidad. Sin reglas normativas, similitud semántica ni recurrencia."
+)
+
+
+def variables_isolation_forest_solo(df: pd.DataFrame) -> pd.DataFrame:
+    """Variables del modelo A, sin texto, CUBSO, ventanas ni 8 UIT."""
+    monto = pd.to_numeric(df["monto_referencial"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    por_entidad = monto.groupby(df["entidad_ruc"].astype(str))
+    desviacion = por_entidad.transform("std").fillna(0.0)
+    z = (monto - por_entidad.transform("mean")) / desviacion.where(desviacion > 0)
+    return pd.DataFrame({
+        "log_monto": np.log1p(monto),
+        "log_compras_entidad": np.log1p(por_entidad.transform("size")),
+        "log_monto_total_entidad": np.log1p(por_entidad.transform("sum")),
+        "z_monto_entidad": z.fillna(0.0),
+    })[list(VARIABLES_IF_SOLO)]
+
+
+def _nuevo_bosque(contaminacion: float, random_state: int) -> Pipeline:
+    return make_pipeline(
+        StandardScaler(),
+        IsolationForest(n_estimators=100, contamination=contaminacion, random_state=random_state),
+    )
+
+
+def entrenar_isolation_forest_referencia(
+    referencia: pd.DataFrame, contaminacion: float = 0.03, random_state: int = 42
+) -> Pipeline:
+    """Entrena el modelo A con compras de referencia (p. ej., CONOSCE), sin etiqueta.
+
+    El bosque aprende cómo luce una compra habitual en muchas compras reales y
+    luego puntúa archivos nuevos sin reentrenarse con ellos. Las compras con
+    monto 0 no describen una adquisición y se descartan.
+    """
+    monto = pd.to_numeric(referencia["monto_referencial"], errors="coerce").fillna(0.0)
+    referencia = referencia.loc[monto > 0]
+    if len(referencia) < 10:
+        raise ValueError("Se necesitan al menos 10 compras de referencia con monto mayor a 0.")
+    modelo = _nuevo_bosque(contaminacion, random_state)
+    return modelo.fit(variables_isolation_forest_solo(referencia).to_numpy(dtype=float))
+
+
+def ajustar_isolation_forest_solo(
+    df: pd.DataFrame,
+    contaminacion: float = 0.03,
+    random_state: int = 42,
+    modelo: Pipeline | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Devuelve qué compras son atípicas y su atipicidad (> 0 = atípica).
+
+    Sin ``modelo``, el bosque se entrena con el propio archivo. Con un modelo
+    entrenado con compras de referencia solo puntúa; las variables de entidad
+    se calculan igualmente con el archivo evaluado.
+    """
+    X = variables_isolation_forest_solo(df).to_numpy(dtype=float)
+    if modelo is None:
+        modelo = _nuevo_bosque(contaminacion, random_state).fit(X)
+    return modelo.predict(X) == -1, -modelo.decision_function(X)
+
+
+def ejecutar_isolation_forest_solo(
+    df_convocatorias: pd.DataFrame,
+    contaminacion: float = 0.03,
+    modo_automatico: bool = True,
+    random_state: int = 42,
+    modelo: Pipeline | None = None,
+) -> pd.DataFrame:
+    """Modelo A: el puntaje sale solo del Isolation Forest.
+
+    Con ``modelo`` (entrenado con compras de referencia) el archivo solo se
+    puntúa; sin él, el bosque se entrena con el propio archivo.
+
+    El bosque solo decide si una compra es atípica o no, así que no hay nivel
+    Medio: una compra atípica queda en riesgo Alto (71 a 100) y el resto en
+    Bajo (0 a 40), en escalas que crecen con la atipicidad. Las columnas
+    propias del sistema completo (reglas, similitud, recurrencia) quedan en
+    valores neutros: este modelo no las calcula.
+    """
+    df = df_convocatorias.copy().reset_index(drop=True)
+    atipica, atipicidad = ajustar_isolation_forest_solo(df, contaminacion, random_state, modelo)
+    origen = "entrenado con compras de referencia" if modelo is not None else "entrenado con este archivo"
+    proporcion = atipicidad / ESCALA_ANOMALIA
+    alto = UMBRAL_ALTO + np.clip(proporcion, 0.0, 1.0) * (100.0 - UMBRAL_ALTO)
+    bajo = (UMBRAL_MEDIO - 0.01) * np.clip(1.0 + proporcion, 0.0, 1.0)
+    puntaje = np.where(atipica, alto, bajo)
+    df["puntaje_riesgo"] = np.round(np.clip(puntaje, 0.0, 100.0), 2)
+    df["score_reglas_negocio"] = 0.0
+    df["bono_ia"] = df["puntaje_riesgo"]
+    df["similitud_nlp"] = 0.0
+    df["max_similitud_nlp"] = 0.0
+    df["frecuencia_compras_30d"] = 1
+    df["monto_acumulado_30d"] = pd.to_numeric(df["monto_referencial"], errors="coerce").fillna(0.0)
+    df["dias_desde_compra_anterior"] = 999
+    df["es_excluido_normativa"] = False
+    df["explicacion_reglas"] = [
+        EXPLICACION_IF_SOLO.format(origen=origen, estado="atípica" if a else "no atípica", atipicidad=v)
+        for a, v in zip(atipica, atipicidad)
+    ]
+    conds = [
+        (df["puntaje_riesgo"] >= UMBRAL_ALTO),
+        (df["puntaje_riesgo"] >= UMBRAL_MEDIO),
+    ]
+    df["nivel_riesgo"] = np.select(conds, ["Alto", "Medio"], default="Bajo")
+    df["es_anomalia"] = atipica.astype(int)
     return procesar_estado_revision(df, modo_automatico=modo_automatico)
 
 

@@ -15,8 +15,13 @@ from modulos_ia.extractor_caracteristicas import (
     extraer_caracteristicas_temporales_y_nlp,
 )
 from modulos_ia.aprendizaje_supervisado import aplicar as aplicar_modelo_supervisado
-from modulos_ia.modelo_aislamiento import UMBRAL_MEDIO, entrenar_y_evaluar_isolation_forest
+from modulos_ia.modelo_aislamiento import (
+    UMBRAL_MEDIO,
+    ejecutar_isolation_forest_solo,
+    entrenar_y_evaluar_isolation_forest,
+)
 from utilidades.enviador_notificaciones import enviar_alerta_riesgo_critico
+from utilidades import gestor_modelo_referencia
 from utilidades.gestor_modelo_supervisado import modelo_activo
 from utilidades.gestor_permisos import tiene_permiso
 from utilidades.mapeador_columnas import (
@@ -362,6 +367,10 @@ def _eliminar_lote(id_lote: int) -> None:
         session.close()
 
 
+MODELO_B = "Modelo B · Sistema completo"
+MODELO_A = "Modelo A · Isolation Forest solo"
+
+
 def _renderizar_procesamiento(datos: pd.DataFrame, nombre_fuente: str) -> None:
     encabezado_seccion(
         "Procesamiento y análisis",
@@ -369,6 +378,20 @@ def _renderizar_procesamiento(datos: pd.DataFrame, nombre_fuente: str) -> None:
         "brain",
     )
 
+    st.radio(
+        "Modelo de detección",
+        (MODELO_B, MODELO_A),
+        key="modelo_ingesta",
+        horizontal=True,
+        help=(
+            "Modelo B: reglas normativas, similitud semántica, recurrencia y ajuste "
+            "estadístico. Modelo A: solo Isolation Forest con variables estructurales y "
+            "estadísticas (monto, compras y gasto de la entidad), sin reglas, similitud "
+            "ni recurrencia. Sirve como línea base para comparar ambos sobre el mismo archivo."
+        ),
+    )
+    if st.session_state.get("modelo_ingesta") == MODELO_A:
+        _renderizar_referencia_modelo_a()
     st.checkbox(
         "Excluir filas que son resúmenes de hallazgo (no son compras)",
         value=True,
@@ -393,6 +416,57 @@ def _renderizar_procesamiento(datos: pd.DataFrame, nombre_fuente: str) -> None:
         use_container_width=True,
         hide_index=True,
     )
+
+
+def _renderizar_referencia_modelo_a() -> None:
+    """Estado y entrenamiento del modelo A con compras de referencia (CONOSCE)."""
+    guardado = gestor_modelo_referencia.modelo_referencia()
+    if guardado is None:
+        st.info(
+            "El modelo A no tiene compras de referencia: se entrenará con el propio archivo. "
+            "Entrénalo con compras del CONOSCE para que aprenda cómo luce una compra habitual."
+        )
+    else:
+        st.success(
+            f"El modelo A usa un Isolation Forest entrenado con {guardado['compras']:,} compras "
+            f"de {guardado['entidades']:,} entidades ({', '.join(guardado['archivos'])}; "
+            f"contaminación {guardado['contaminacion']}, {guardado['fecha']})."
+        )
+    if not tiene_permiso("cambiar_configuracion"):
+        return
+    with st.expander("Entrenar el modelo A con compras de referencia"):
+        st.caption(
+            "Archivos sin etiqueta con muchas compras reales (p. ej., adjudicaciones del "
+            "CONOSCE). Reemplazan al modelo guardado; no se guardan como lotes."
+        )
+        archivos = st.file_uploader(
+            "Archivos de referencia (.xlsx, .csv)",
+            type=["xlsx", "csv"],
+            accept_multiple_files=True,
+            key="uploader_referencia",
+        )
+        columnas = st.columns(2)
+        if columnas[0].button("Entrenar y guardar", disabled=not archivos):
+            try:
+                tablas = [
+                    leer_csv_con_codificacion(a) if a.name.lower().endswith(".csv") else pd.read_excel(a)
+                    for a in archivos
+                ]
+                contaminacion = _obtener_parametros_pipeline()["frecuencia_contaminacion"]
+                nuevo = gestor_modelo_referencia.entrenar_y_guardar(
+                    tablas, [a.name for a in archivos], contaminacion)
+                registrar_log(
+                    st.session_state.get("id_usuario", 1),
+                    "Modelo A entrenado con referencia",
+                    "Ingesta",
+                    f"{nuevo['compras']} compras de {', '.join(nuevo['archivos'])}.",
+                )
+                st.rerun()
+            except Exception as error:
+                st.error(f"No fue posible entrenar el modelo A: {error}")
+        if guardado is not None and columnas[1].button("Quitar la referencia"):
+            gestor_modelo_referencia.eliminar()
+            st.rerun()
 
 
 def _procesar_fuente(datos: pd.DataFrame, nombre_fuente: str) -> None:
@@ -429,35 +503,57 @@ def _procesar_fuente(datos: pd.DataFrame, nombre_fuente: str) -> None:
                 raise ValueError("Todas las filas eran resúmenes de hallazgo; no hay compras que evaluar.")
         progreso.progress(25)
 
-        estado.text("2/4 · Calculando recurrencia y similitud temática")
-        caracteristicas = extraer_caracteristicas_temporales_y_nlp(
-            normalizados,
-            ventana_dias=parametros["ventana_dias"],
-            uit_vigente=parametros["monto_uit_vigente"],
-            umbral_similitud_nlp=parametros["umbral_similitud_nlp"],
-        )
-        progreso.progress(50)
-
-        estado.text("3/4 · Evaluando patrones estadísticos")
-        resultados, _, _ = entrenar_y_evaluar_isolation_forest(
-            caracteristicas,
-            contaminacion=parametros["frecuencia_contaminacion"],
-        )
-        # Solo puntúa si un administrador activó un modelo que superó la
-        # validación; si no, los resultados quedan exactamente como estaban.
-        activo = modelo_activo(obtener_engine())
-        if activo is not None:
-            resultados = aplicar_modelo_supervisado(resultados, activo[1])
-            st.info(
-                f"Puntaje calculado con el modelo supervisado activo (id {activo[0]}); "
-                "cada motivo conserva el puntaje de reglas + ajuste como referencia."
+        if st.session_state.get("modelo_ingesta") == MODELO_A:
+            estado.text("2/4 · Calculando variables estructurales y estadísticas")
+            progreso.progress(50)
+            estado.text("3/4 · Evaluando con Isolation Forest (modelo A)")
+            guardado = gestor_modelo_referencia.modelo_referencia()
+            if guardado is not None and guardado["contaminacion"] != parametros["frecuencia_contaminacion"]:
+                st.warning(
+                    f"El modelo A se entrenó con contaminación {guardado['contaminacion']} y la "
+                    f"configuración actual es {parametros['frecuencia_contaminacion']}; se usa la "
+                    "del entrenamiento. Vuelve a entrenarlo para aplicar la nueva."
+                )
+            resultados = ejecutar_isolation_forest_solo(
+                normalizados,
+                contaminacion=parametros["frecuencia_contaminacion"],
+                modelo=None if guardado is None else guardado["modelo"],
             )
+            # El nombre del lote indica el modelo para distinguirlo al comparar.
+            nombre_lote = f"{nombre_fuente} · {MODELO_A}"
+            if guardado is not None:
+                nombre_lote += f" (referencia {guardado['compras']:,} compras)"
+        else:
+            estado.text("2/4 · Calculando recurrencia y similitud temática")
+            caracteristicas = extraer_caracteristicas_temporales_y_nlp(
+                normalizados,
+                ventana_dias=parametros["ventana_dias"],
+                uit_vigente=parametros["monto_uit_vigente"],
+                umbral_similitud_nlp=parametros["umbral_similitud_nlp"],
+            )
+            progreso.progress(50)
+
+            estado.text("3/4 · Evaluando patrones estadísticos")
+            resultados, _, _ = entrenar_y_evaluar_isolation_forest(
+                caracteristicas,
+                contaminacion=parametros["frecuencia_contaminacion"],
+            )
+            # Solo puntúa si un administrador activó un modelo que superó la
+            # validación; si no, los resultados quedan exactamente como estaban.
+            activo = modelo_activo(obtener_engine())
+            if activo is not None:
+                resultados = aplicar_modelo_supervisado(resultados, activo[1])
+                st.info(
+                    f"Puntaje calculado con el modelo supervisado activo (id {activo[0]}); "
+                    "cada motivo conserva el puntaje de reglas + ajuste como referencia."
+                )
+            nombre_lote = nombre_fuente
         progreso.progress(75)
 
         estado.text("4/4 · Guardando resultados y registrando trazabilidad")
         alertas = _persistir_resultados(
             resultados,
-            nombre_fuente,
+            nombre_lote,
             parametros,
         )
         progreso.progress(100)

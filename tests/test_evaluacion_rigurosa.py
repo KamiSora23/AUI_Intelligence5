@@ -10,9 +10,11 @@ from evaluacion_rigurosa import (
     intervalo_95,
     isolation_forest_solo,
     metricas,
+    mismas_alertas,
     por_entidad,
     triaje,
     validacion_anidada,
+    variables_if_base,
 )
 
 
@@ -73,18 +75,54 @@ class EvaluacionRigurosaTest(unittest.TestCase):
                           multiples["alto_o_pendiente"]), (2, 1, 2))
         self.assertEqual(contexto.loc["Entidades con una sola compra", "detectados_alto"], 0)
 
-    def test_isolation_forest_solo_marca_lo_atipico_sin_nlp(self):
-        # 19 compras parecidas y una muy distinta en todas las variables; la
-        # similitud semántica no debe influir en la decisión.
+    def test_isolation_forest_solo_marca_lo_atipico_sin_texto_ni_cubso(self):
+        # 19 compras parecidas y una de monto muy superior en la misma entidad.
         rng = np.random.default_rng(0)
-        datos = pd.DataFrame({c: rng.normal(100, 5, 20) for c in VARIABLES_IF_BASE})
-        datos.loc[19, list(VARIABLES_IF_BASE)] = 5000
-        datos["max_similitud_nlp"] = 1.0
+        datos = pd.DataFrame({
+            "entidad_ruc": ["20100000001"] * 10 + ["20100000002"] * 10,
+            "monto_referencial": rng.normal(10000, 500, 20),
+            "fecha_convocatoria": pd.date_range("2024-01-01", periods=20, freq="7D").astype(str),
+            "descripcion_item": ["Compra de papel bond"] * 20,
+            "codigo_cubso": ["1410150100"] * 20,
+        })
+        datos.loc[19, "monto_referencial"] = 400000
+        self.assertEqual(list(variables_if_base(datos).columns), list(VARIABLES_IF_BASE))
         decision, puntaje = isolation_forest_solo(datos, contaminacion=0.05)
         self.assertEqual(np.flatnonzero(decision).tolist(), [19])
         self.assertEqual(int(np.argmax(puntaje)), 19)
-        datos["max_similitud_nlp"] = 0.0
-        self.assertEqual(isolation_forest_solo(datos, 0.05)[0].tolist(), decision.tolist())
+
+        # El texto, el CUBSO y las fechas (ventanas y UIT del año) pertenecen
+        # al sistema completo: cambiarlos no debe mover la decisión del modelo base.
+        self.assertNotIn("ratio_monto_8uit", VARIABLES_IF_BASE)
+        otros = datos.assign(descripcion_item=[f"Servicio distinto {i}" for i in range(20)],
+                             codigo_cubso=[str(i) for i in range(20)],
+                             fecha_convocatoria=pd.date_range("2018-01-01", periods=20, freq="90D").astype(str))
+        otra_decision, otro_puntaje = isolation_forest_solo(otros, contaminacion=0.05)
+        self.assertEqual(otra_decision.tolist(), decision.tolist())
+        np.testing.assert_allclose(otro_puntaje, puntaje)
+
+    def test_isolation_forest_con_referencia_puntua_sin_reentrenarse(self):
+        # Referencia: muchas compras habituales (entre S/ 2 mil y 20 mil).
+        rng = np.random.default_rng(1)
+        referencia = pd.DataFrame({
+            "entidad_ruc": rng.integers(0, 40, 400).astype(str),
+            "monto_referencial": np.exp(rng.uniform(np.log(2000), np.log(20000), 400)),
+        })
+        referencia.loc[:4, "monto_referencial"] = 0.0  # sin monto: se descartan
+        evaluado = pd.DataFrame({"entidad_ruc": ["A"] * 6, "monto_referencial": [5000.0] * 5 + [900000.0]})
+        decision, puntaje = isolation_forest_solo(evaluado, 0.03, referencia=referencia)
+        self.assertEqual(np.flatnonzero(decision).tolist(), [5])
+        # Sin referencia, cinco compras iguales y una distinta no bastan para el
+        # bosque entrenado con el propio archivo: el resultado debe ser otro.
+        _, propio = isolation_forest_solo(evaluado, 0.03)
+        self.assertFalse(np.allclose(propio, puntaje))
+        with self.assertRaises(ValueError):
+            isolation_forest_solo(evaluado, 0.03, referencia=referencia.iloc[:8])
+
+    def test_mismas_alertas_marca_los_puntajes_mas_altos(self):
+        decision = mismas_alertas(np.array([0.1, 0.9, 0.5, 0.9, -0.2]), 3)
+        self.assertEqual(decision.tolist(), [False, True, True, True, False])
+        self.assertFalse(mismas_alertas(np.array([0.3, 0.1]), 0).any())
 
     def test_triaje_reparte_todos_los_casos(self):
         y = np.array([1, 1, 0, 0, 1])
