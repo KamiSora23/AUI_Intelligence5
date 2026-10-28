@@ -20,11 +20,36 @@ CARPETA_MODELOS = Path(__file__).resolve().parents[1] / "modelos_entrenados"
 RUTA_MODELO = CARPETA_MODELOS / "isolation_forest_referencia.joblib"
 
 
+def _claves(tabla: pd.DataFrame) -> pd.Series:
+    monto = pd.to_numeric(tabla["monto_referencial"], errors="coerce").round(2)
+    return pd.Series(list(zip(tabla["entidad_ruc"].astype(str), monto, tabla["fecha_convocatoria"].astype(str))),
+                     index=tabla.index)
+
+
 def preparar_referencia(tablas: list[pd.DataFrame]) -> pd.DataFrame:
-    """Normaliza y une las tablas; quedan solo las compras con monto mayor a 0."""
-    referencia = pd.concat([normalizar_y_emparejar_columnas(t) for t in tablas], ignore_index=True)
+    """Normaliza y une las tablas; quedan solo las compras con monto mayor a 0.
+
+    Un mismo ítem puede venir en varios archivos (p. ej., las convocatorias y
+    las adjudicaciones de 2024): se descarta la compra cuya entidad, monto y
+    fecha ya estaban en un archivo anterior, para no contarla dos veces. Las
+    repeticiones dentro de un mismo archivo se conservan: pueden ser ítems
+    distintos de igual monto.
+    """
+    vistas: set = set()
+    partes = []
+    duplicadas = 0
+    for tabla in tablas:
+        normalizada = normalizar_y_emparejar_columnas(tabla)
+        claves = _claves(normalizada)
+        repetida = claves.isin(vistas)
+        duplicadas += int(repetida.sum())
+        partes.append(normalizada.loc[~repetida])
+        vistas.update(claves)
+    referencia = pd.concat(partes, ignore_index=True)
     monto = pd.to_numeric(referencia["monto_referencial"], errors="coerce").fillna(0.0)
-    return referencia.loc[monto > 0].reset_index(drop=True)
+    referencia = referencia.loc[monto > 0].reset_index(drop=True)
+    referencia.attrs["duplicadas_entre_archivos"] = duplicadas
+    return referencia
 
 
 def entrenar_y_guardar(
@@ -35,6 +60,7 @@ def entrenar_y_guardar(
     guardado = {
         "modelo": entrenar_isolation_forest_referencia(referencia, contaminacion),
         "compras": len(referencia),
+        "duplicadas_entre_archivos": int(referencia.attrs.get("duplicadas_entre_archivos", 0)),
         "entidades": int(referencia["entidad_ruc"].astype(str).nunique()),
         "archivos": list(archivos),
         "contaminacion": float(contaminacion),
@@ -64,7 +90,8 @@ def main(argv=None) -> int:
     tablas = [pd.read_csv(r) if r.suffix.lower() == ".csv" else pd.read_excel(r) for r in args.archivos]
     guardado = entrenar_y_guardar(tablas, [r.name for r in args.archivos], args.contaminacion)
     print(f"Modelo A entrenado con {guardado['compras']:,} compras de {guardado['entidades']:,} entidades "
-          f"(contaminación {guardado['contaminacion']}) y guardado en {RUTA_MODELO}")
+          f"(contaminación {guardado['contaminacion']}; {guardado['duplicadas_entre_archivos']:,} repetidas "
+          f"entre archivos descartadas) y guardado en {RUTA_MODELO}")
     return 0
 
 
