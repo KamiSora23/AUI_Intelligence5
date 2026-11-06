@@ -51,13 +51,36 @@ def _matriz_variables(df: pd.DataFrame, mask: pd.Series) -> np.ndarray:
     ])
 
 
+def entrenar_isolation_forest_hibrido(
+    df_caracteristicas: pd.DataFrame, contaminacion: float = 0.03, random_state: int = 42
+) -> Pipeline:
+    """Entrena el bosque del modelo B con compras de referencia (p. ej., del OECE).
+
+    Recibe la salida del extractor para esas compras. El bosque aprende cómo se
+    comportan la recurrencia, la similitud y el monto acumulado en muchas
+    compras reales y luego solo puntúa los archivos nuevos.
+    """
+    df = df_caracteristicas
+    mask = ~df['es_excluido_normativa'].astype(bool) if 'es_excluido_normativa' in df.columns         else pd.Series(True, index=df.index)
+    if mask.sum() < 10:
+        raise ValueError("Se necesitan al menos 10 compras de referencia no exentas.")
+    return _nuevo_bosque(contaminacion, random_state).fit(_matriz_variables(df, mask))
+
+
 def ejecutar_modelo_aislamiento_hibrido(
     df_procesado: pd.DataFrame,
     contaminacion: float = 0.03,
     modo_automatico: bool = True,
     random_state: int = 42,
+    modelo: Pipeline | None = None,
 ) -> pd.DataFrame:
-    """Suma al puntaje reglado un ajuste (0 a 20) solo a operaciones atípicas."""
+    """Suma al puntaje reglado un ajuste (0 a 20) solo a operaciones atípicas.
+
+    Sin ``modelo``, el bosque se entrena con el propio archivo; con un modelo
+    entrenado con compras de referencia, solo puntúa. La atipicidad de cada
+    compra queda en ``atipicidad_ia`` (mayor = más atípica) y sirve para
+    ordenar las compras que empatan en puntaje.
+    """
     df = df_procesado.copy()
 
     if 'es_excluido_normativa' not in df.columns:
@@ -69,18 +92,18 @@ def ejecutar_modelo_aislamiento_hibrido(
 
     mask_eval = ~df['es_excluido_normativa'].astype(bool)
     df['bono_ia'] = 0.0
+    df['atipicidad_ia'] = np.nan
 
-    if mask_eval.sum() >= 3:
-        X = StandardScaler().fit_transform(_matriz_variables(df, mask_eval))
-        iso = IsolationForest(
-            n_estimators=100,
-            contamination=contaminacion,
-            random_state=random_state,
-        ).fit(X)
+    if mask_eval.sum() >= (1 if modelo is not None else 3):
+        X = _matriz_variables(df, mask_eval)
+        if modelo is None:
+            modelo = _nuevo_bosque(contaminacion, random_state).fit(X)
         # decision_function < 0 marca a las operaciones atípicas; las normales
         # (>= 0) no reciben ajuste.
-        atipicidad = np.clip(-iso.decision_function(X) / ESCALA_ANOMALIA, 0.0, 1.0)
-        df.loc[mask_eval, 'bono_ia'] = np.round(atipicidad * BONO_MAXIMO, 2)
+        atipicidad = -modelo.decision_function(X)
+        df.loc[mask_eval, 'atipicidad_ia'] = atipicidad
+        df.loc[mask_eval, 'bono_ia'] = np.round(
+            np.clip(atipicidad / ESCALA_ANOMALIA, 0.0, 1.0) * BONO_MAXIMO, 2)
 
     df['puntaje_riesgo'] = np.clip(df['score_reglas_negocio'] + df['bono_ia'], 0.0, 100.0)
 
@@ -93,6 +116,18 @@ def ejecutar_modelo_aislamiento_hibrido(
     df['es_anomalia'] = (df['puntaje_riesgo'] >= UMBRAL_ALTO).astype(int)
 
     return procesar_estado_revision(df, modo_automatico=modo_automatico)
+
+
+def orden_de_prioridad(puntaje, atipicidad) -> np.ndarray:
+    """Posiciones de mayor a menor riesgo.
+
+    Primero el puntaje; entre puntajes iguales, la compra más atípica según el
+    Isolation Forest; si también empatan, la primera del archivo. Las compras
+    sin atipicidad (exentas) van al final de su puntaje.
+    """
+    puntaje = np.asarray(puntaje, dtype=float)
+    atipicidad = np.nan_to_num(np.asarray(atipicidad, dtype=float), nan=-np.inf)
+    return np.lexsort((np.arange(len(puntaje)), -atipicidad, -puntaje))
 
 
 # --- Modelo A: Isolation Forest por sí solo -----------------------------------
@@ -214,6 +249,7 @@ def ejecutar_isolation_forest_solo(
     ]
     df["nivel_riesgo"] = np.select(conds, ["Alto", "Medio"], default="Bajo")
     df["es_anomalia"] = atipica.astype(int)
+    df["atipicidad_ia"] = atipicidad
     return procesar_estado_revision(df, modo_automatico=modo_automatico)
 
 
@@ -222,6 +258,7 @@ def entrenar_y_evaluar_isolation_forest(
     contaminacion: float = 0.03,
     random_state: int = 42,
     modo_automatico: bool = True,
+    modelo: Pipeline | None = None,
 ):
     """Mantiene la firma utilizada por la capa de ingesta."""
     df_res = ejecutar_modelo_aislamiento_hibrido(
@@ -229,5 +266,6 @@ def entrenar_y_evaluar_isolation_forest(
         contaminacion=contaminacion,
         modo_automatico=modo_automatico,
         random_state=random_state,
+        modelo=modelo,
     )
     return df_res, None, None

@@ -67,6 +67,18 @@ def _crear_engine_internal():
                         "ADD COLUMN etiqueta_referencia TINYINT(1) NULL"
                     )
                 )
+            # Atipicidad del Isolation Forest: ordena las compras que empatan
+            # en puntaje de riesgo.
+            if "atipicidad_ia" not in {
+                columna["name"]
+                for columna in inspect(engine).get_columns("resultados_anomalias")
+            }:
+                conn.execute(
+                    text(
+                        "ALTER TABLE resultados_anomalias "
+                        "ADD COLUMN atipicidad_ia DOUBLE NULL"
+                    )
+                )
             # Ventana con la que se procesó cada lote; la configuración puede
             # cambiar después y no describiría los resultados ya guardados.
             if "ventana_dias" not in {
@@ -229,6 +241,7 @@ def _inicializar_sqlite_fallback(engine):
             "resultados_anomalias": {
                 "score_reglas_negocio": "REAL DEFAULT 0",
                 "bono_ia": "REAL DEFAULT 0",
+                "atipicidad_ia": "REAL NULL",
                 "nivel_riesgo": "TEXT DEFAULT 'Bajo'",
                 "explicacion_reglas": "TEXT NULL",
             },

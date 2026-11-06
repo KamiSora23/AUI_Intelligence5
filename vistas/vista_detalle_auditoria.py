@@ -40,7 +40,9 @@ def _cargar_expedientes_lote(lote_id: int) -> pd.DataFrame:
                 JOIN resultados_anomalias r
                   ON c.id_convocatoria = r.id_convocatoria
                 WHERE c.id_carga = :lote
-                ORDER BY r.puntaje_riesgo DESC
+                ORDER BY r.puntaje_riesgo DESC,
+                         r.atipicidad_ia IS NULL, r.atipicidad_ia DESC,
+                         r.id_resultado
                 """
             ),
             {"lote": lote_id},

@@ -130,12 +130,13 @@ def agregar_contexto(datos: pd.DataFrame, rutas) -> pd.DataFrame:
     return pd.concat([datos, contexto], ignore_index=True)
 
 
-def puntuar(datos, ventana, uit, umbral_nlp, contaminacion) -> pd.DataFrame:
+def puntuar(datos, ventana, uit, umbral_nlp, contaminacion, modelo=None) -> pd.DataFrame:
+    """Modelo B; con ``modelo`` (bosque entrenado con referencia) el bosque solo puntúa."""
     caracteristicas = extraer_caracteristicas_temporales_y_nlp(
         datos, ventana_dias=ventana, uit_vigente=uit, umbral_similitud_nlp=umbral_nlp,
     )
     return ejecutar_modelo_aislamiento_hibrido(
-        caracteristicas, contaminacion=contaminacion, modo_automatico=False,
+        caracteristicas, contaminacion=contaminacion, modo_automatico=False, modelo=modelo,
     )
 
 

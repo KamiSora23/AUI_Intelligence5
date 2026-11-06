@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS resultados_anomalias (
     dias_desde_compra_anterior INT NOT NULL,
     score_reglas_negocio DECIMAL(6,2) DEFAULT 0,
     bono_ia DECIMAL(6,2) DEFAULT 0,
+    atipicidad_ia DOUBLE NULL, -- atipicidad del Isolation Forest; ordena los empates de puntaje
     puntaje_riesgo DECIMAL(6,2) NOT NULL,
     nivel_riesgo VARCHAR(20) DEFAULT 'Bajo',
     es_anomalia TINYINT(1) NOT NULL,

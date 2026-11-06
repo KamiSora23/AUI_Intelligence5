@@ -154,3 +154,19 @@ def test_modelo_a_con_referencia_guardada():
         finally:
             gestor.RUTA_MODELO = ruta_original
             gestor.CARPETA_MODELOS = ruta_original.parent
+
+
+def test_modelo_b_con_bosque_de_referencia_y_orden_de_empates():
+    from modulos_ia.modelo_aislamiento import entrenar_isolation_forest_hibrido, orden_de_prioridad
+
+    # Referencia: compras habituales de varias entidades, sin recurrencia marcada.
+    referencia = _df([_fila(str(i % 40), f"insumo distinto {i}", 2000 + 13 * i, f"2024-{1 + i % 12:02d}-{1 + i % 27:02d}")
+                      for i in range(200)])
+    bosque = entrenar_isolation_forest_hibrido(extraer(referencia, uit_vigente=5150))
+    d = _df([_fila("1", "compra de papel bond a4", 9000, f"2024-03-{i:02d}") for i in (1, 8, 15)])
+    r = ejecutar_modelo_aislamiento_hibrido(extraer(d, uit_vigente=5150), modelo=bosque, modo_automatico=False)
+    assert r["atipicidad_ia"].notna().all()
+    assert ((r["bono_ia"] >= 0) & (r["bono_ia"] <= 20)).all()
+    # Mismo puntaje: va primero la más atípica; luego, la primera del archivo.
+    assert orden_de_prioridad([80, 80, 90, 80], [0.1, 0.3, -1.0, float("nan")]).tolist() == [2, 1, 0, 3]
+    assert orden_de_prioridad([50, 50], [0.2, 0.2]).tolist() == [0, 1]

@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import text
 from base_datos.conexion_bd import obtener_engine, obtener_session
+from modulos_ia.modelo_aislamiento import orden_de_prioridad
 from utilidades.estados_revision import describir_estado_revision, texto_ventana
 from utilidades.exportador_resultados import construir_excel_resultados
 from utilidades.gestor_lotes import renderizar_selector_lote_global, ventana_del_lote
@@ -46,6 +47,7 @@ def _cargar_datos_dashboard(lote_id: int) -> pd.DataFrame:
                     r.dias_desde_compra_anterior,
                     r.score_reglas_negocio,
                     r.bono_ia,
+                    r.atipicidad_ia,
                     r.puntaje_riesgo,
                     r.nivel_riesgo,
                     r.es_anomalia,
@@ -58,7 +60,11 @@ def _cargar_datos_dashboard(lote_id: int) -> pd.DataFrame:
                 JOIN convocatorias_procesadas c
                     ON r.id_convocatoria = c.id_convocatoria
                 WHERE c.id_carga = :lote
-                ORDER BY r.puntaje_riesgo DESC
+                -- Empates de puntaje: primero la compra más atípica según
+                -- el Isolation Forest; si también empatan, la primera guardada.
+                ORDER BY r.puntaje_riesgo DESC,
+                         r.atipicidad_ia IS NULL, r.atipicidad_ia DESC,
+                         r.id_resultado
                 """
             ),
             {"lote": lote_id},
@@ -72,16 +78,26 @@ def _cargar_datos_dashboard(lote_id: int) -> pd.DataFrame:
         session.close()
 
 
+def ordenar_por_riesgo(datos: pd.DataFrame) -> pd.DataFrame:
+    """Mayor puntaje primero; los empates, por atipicidad del Isolation Forest."""
+    if datos.empty or "puntaje_riesgo" not in datos.columns:
+        return datos.copy()
+    atipicidad = (
+        pd.to_numeric(datos["atipicidad_ia"], errors="coerce")
+        if "atipicidad_ia" in datos.columns
+        else pd.Series(float("nan"), index=datos.index)
+    )
+    orden = orden_de_prioridad(pd.to_numeric(datos["puntaje_riesgo"], errors="coerce").fillna(0.0), atipicidad)
+    return datos.iloc[orden].copy()
+
+
 def _preparar_paginas_dashboard(
     datos: pd.DataFrame,
     pagina_matriz: int,
     pagina_casos: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, tuple[int, int]]]:
     """Ordena y pagina las dos vistas extensas sin alterar los datos fuente."""
-    ordenados = datos.sort_values(
-        by="puntaje_riesgo",
-        ascending=False,
-    ).copy()
+    ordenados = ordenar_por_riesgo(datos)
     matriz, actual_matriz, total_matriz = paginar_dataframe(
         ordenados,
         pagina_matriz,
@@ -398,10 +414,7 @@ def renderizar_vista_dashboard():
 
     df_render = df_matriz
     filas_resultados = []
-    for _, fila in df_render.sort_values(
-        by="puntaje_riesgo",
-        ascending=False,
-    ).iterrows():
+    for _, fila in ordenar_por_riesgo(df_render).iterrows():
         puntaje = float(fila["puntaje_riesgo"])
         tono = "high" if puntaje >= 71 else ("medium" if puntaje >= 41 else "low")
         nivel = "Alto" if puntaje >= 71 else ("Medio" if puntaje >= 41 else "Bajo")

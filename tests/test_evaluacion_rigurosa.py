@@ -12,6 +12,7 @@ from evaluacion_rigurosa import (
     metricas,
     mismas_alertas,
     por_entidad,
+    priorizacion,
     triaje,
     validacion_anidada,
     variables_if_base,
@@ -118,6 +119,19 @@ class EvaluacionRigurosaTest(unittest.TestCase):
         self.assertFalse(np.allclose(propio, puntaje))
         with self.assertRaises(ValueError):
             isolation_forest_solo(evaluado, 0.03, referencia=referencia.iloc[:8])
+
+    def test_priorizacion_resuelve_los_empates_del_corte(self):
+        # 10 compras, k = 2: dos empatan en 80 en el corte (una positiva, una no).
+        y = np.array([1, 1, 0, 1, 0, 0, 1, 0, 0, 0])
+        puntaje = np.array([90, 80, 80, 10, 5, 5, 5, 5, 5, 5])
+        atipicidad = np.array([0.0, -0.1, 0.2, 0, 0, 0, 0, 0, 0, 0])
+        t = priorizacion(y, puntaje, atipicidad, 0.2).set_index("criterio")
+        self.assertEqual(t.loc["Desempate por atipicidad del Isolation Forest (app)", "positivos_en_top"], 1)
+        self.assertEqual(t.loc["Orden del archivo en los empates", "positivos_en_top"], 2)
+        self.assertAlmostEqual(t.loc["Valor esperado con empates al azar", "positivos_en_top"], 1.5)
+        # Gain = (2 - 2·4/10) / 4 y Lift = (2/2) / (4/10).
+        self.assertAlmostEqual(t.loc["Orden del archivo en los empates", "gain"], 0.3)
+        self.assertAlmostEqual(t.loc["Orden del archivo en los empates", "lift"], 2.5)
 
     def test_mismas_alertas_marca_los_puntajes_mas_altos(self):
         decision = mismas_alertas(np.array([0.1, 0.9, 0.5, 0.9, -0.2]), 3)

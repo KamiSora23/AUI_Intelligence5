@@ -17,7 +17,12 @@ ser fiable:
 - Comparación con líneas base (marcar todo, solo reglas, Isolation Forest
   por sí solo) y efecto de cada parámetro por separado. Con ``--referencia``
   se agrega el Isolation Forest entrenado con compras de referencia sin
-  etiqueta (p. ej., CONOSCE) y aplicado a este archivo sin reentrenarse.
+  etiqueta (p. ej., del OECE) y aplicado a este archivo sin reentrenarse,
+  tanto solo (modelo A) como dentro del sistema completo (modelo B).
+- Priorización: Gain(k) y Lift(k) en el 20 % de mayor riesgo. Entre compras
+  con el mismo puntaje decide la atipicidad del Isolation Forest, igual que
+  en la app; se informa también el orden del archivo y el valor esperado si
+  los empates se ordenaran al azar.
 - Medidas complementarias, que responden a otra pregunta y no sustituyen a
   la medida por compra: detección por entidad y sensibilidad sobre compras de
   entidades con más de una compra.
@@ -40,9 +45,10 @@ from modulos_ia.modelo_aislamiento import (
     VARIABLES_IF_SOLO as VARIABLES_IF_BASE,
     ajustar_isolation_forest_solo,
     entrenar_isolation_forest_referencia,
+    orden_de_prioridad,
     variables_isolation_forest_solo as variables_if_base,
 )
-from utilidades.gestor_modelo_referencia import preparar_referencia
+from utilidades.gestor_modelo_referencia import entrenar_modelo_b, preparar_referencia
 
 OPCIONES_SIMILITUD = (0.45, 0.50, 0.55, 0.60, 0.65, 0.70)
 SIMILITUD_POR_DEFECTO = 0.50
@@ -123,6 +129,40 @@ def mismas_alertas(puntaje: np.ndarray, alertas: int) -> np.ndarray:
     return decision
 
 
+def priorizacion(
+    y: np.ndarray, puntaje: np.ndarray, atipicidad: np.ndarray, fraccion: float = 0.20
+) -> pd.DataFrame:
+    """Gain(k) y Lift(k) en las k compras de mayor riesgo (k = fracción del total).
+
+    Gain(k) = (positivos en el top k - positivos esperados al azar) / positivos
+    totales; Lift(k) = proporción de positivos en el top k / proporción total.
+    Se comparan tres formas de resolver los empates de puntaje en el corte.
+    """
+    y = np.asarray(y, dtype=int)
+    puntaje = np.asarray(puntaje, dtype=float)
+    n, positivos = len(y), int(y.sum())
+    k = max(1, int(round(fraccion * n)))
+    esperados = k * positivos / n
+    corte = np.sort(puntaje)[::-1][k - 1]
+    arriba, empate = puntaje > corte, puntaje == corte
+    al_azar = y[arriba].sum() + (k - arriba.sum()) * y[empate].mean()
+    filas = []
+    for criterio, aciertos in (
+        ("Desempate por atipicidad del Isolation Forest (app)",
+         y[orden_de_prioridad(puntaje, atipicidad)[:k]].sum()),
+        ("Orden del archivo en los empates", y[np.argsort(-puntaje, kind="stable")[:k]].sum()),
+        ("Valor esperado con empates al azar", al_azar),
+    ):
+        filas.append({
+            "criterio": criterio, "k": k, "positivos_en_top": round(float(aciertos), 2),
+            "esperados_al_azar": round(esperados, 2),
+            "empatados_en_el_corte": int(empate.sum()),
+            "gain": (aciertos - esperados) / positivos if positivos else np.nan,
+            "lift": (aciertos / k) / (positivos / n) if positivos else np.nan,
+        })
+    return pd.DataFrame(filas)
+
+
 def validacion_anidada(
     y: np.ndarray,
     entidades: np.ndarray,
@@ -164,6 +204,7 @@ def comparar(
     umbral: float,
     repeticiones: int = 2000,
     isolation_forest: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    hibrido_referencia: tuple[str, np.ndarray] | None = None,
 ) -> tuple[pd.DataFrame, dict[float, int]]:
     """Tabla comparativa: líneas base, configuración elegida y validación anidada.
 
@@ -190,6 +231,9 @@ def comparar(
          puntajes[similitud] >= umbral, puntajes[similitud], True),
         ("Híbrido, validación anidada por entidad", anidada, puntaje_anidado, True),
     ]
+    if hibrido_referencia is not None:
+        nombre, puntaje_ref = hibrido_referencia
+        candidatos.append((nombre, puntaje_ref >= umbral, puntaje_ref, True))
     filas = []
     for nombre, decision, puntaje, con_intervalo in candidatos:
         fila = {"modelo": nombre, **metricas(y, decision, puntaje)}
@@ -350,13 +394,25 @@ def main(argv=None) -> int:
         "contaminacion": args.contaminacion, "repeticiones_ic": args.repeticiones,
     }])
     variantes_if = {"entrenado con este archivo": isolation_forest_solo(datos, args.contaminacion)}
+    hibrido_ref = None
+    tablas_prioridad = [priorizacion(y, puntajes[args.similitud],
+                                     resultados[args.similitud]["atipicidad_ia"].to_numpy(float))
+                        .assign(modelo=f"Híbrido {args.similitud:.2f}, bosque del archivo")]
     if args.referencia:
         referencia = preparar_referencia([_leer(r) for r in args.referencia])
         resumen["compras_referencia_if"] = len(referencia)
         variantes_if[f"entrenado con referencia ({len(referencia):,} compras)"] = isolation_forest_solo(
             datos, args.contaminacion, referencia=referencia)
+        bosque_b = entrenar_modelo_b(referencia, args.contaminacion, args.ventana, args.uit, args.similitud)
+        con_ref = puntuar(datos, args.ventana, args.uit, args.similitud, args.contaminacion, modelo=bosque_b)
+        nombre_ref = f"Híbrido {args.similitud:.2f}, bosque entrenado con referencia ({len(referencia):,} compras)"
+        hibrido_ref = (nombre_ref, con_ref["puntaje_riesgo"].to_numpy(float))
+        tablas_prioridad.append(
+            priorizacion(y, hibrido_ref[1], con_ref["atipicidad_ia"].to_numpy(float)).assign(modelo=nombre_ref))
     comparacion, elegidas = comparar(
-        y, entidades, puntajes, reglas, args.similitud, args.umbral, args.repeticiones, variantes_if)
+        y, entidades, puntajes, reglas, args.similitud, args.umbral, args.repeticiones, variantes_if,
+        hibrido_ref)
+    tabla_prioridad = pd.concat(tablas_prioridad, ignore_index=True)
     tabla_triaje = triaje(y, puntajes[args.similitud], args.umbral)
     composicion = composicion_etiqueta(y, entidades)
     tabla_entidad = por_entidad(y, entidades, puntajes[args.similitud], args.umbral)
@@ -371,6 +427,9 @@ def main(argv=None) -> int:
     print("\nComparación (IC 95 % remuestreando entidades):")
     print(comparacion.round(3).to_string(index=False))
     print("\nSimilitud elegida en la validación anidada (veces):", elegidas)
+    print("\nPriorización en el 20 % de mayor riesgo (Gain y Lift):")
+    print(tabla_prioridad[["modelo", "criterio", "k", "positivos_en_top", "esperados_al_azar",
+                           "empatados_en_el_corte", "gain", "lift"]].round(4).to_string(index=False))
     print("\nTriaje con la configuración evaluada:")
     print(tabla_triaje.to_string(index=False))
     print("\nMedidas complementarias (responden a otra pregunta; no sustituyen a la medida por compra)")
@@ -391,6 +450,7 @@ def main(argv=None) -> int:
             pd.DataFrame([{"similitud": u, "veces_elegida": n} for u, n in sorted(elegidas.items())]).to_excel(
                 escritor, sheet_name="Anidada", index=False)
             tabla_triaje.to_excel(escritor, sheet_name="Triaje", index=False)
+            tabla_prioridad.to_excel(escritor, sheet_name="Priorizacion", index=False)
             composicion.to_excel(escritor, sheet_name="Etiqueta", index=False)
             tabla_entidad.to_excel(escritor, sheet_name="PorEntidad", index=False)
             tabla_contexto.to_excel(escritor, sheet_name="ConContexto", index=False)

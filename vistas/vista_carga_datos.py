@@ -390,8 +390,7 @@ def _renderizar_procesamiento(datos: pd.DataFrame, nombre_fuente: str) -> None:
             "ni recurrencia. Sirve como línea base para comparar ambos sobre el mismo archivo."
         ),
     )
-    if st.session_state.get("modelo_ingesta") == MODELO_A:
-        _renderizar_referencia_modelo_a()
+    _renderizar_referencia("A" if st.session_state.get("modelo_ingesta") == MODELO_A else "B")
     st.checkbox(
         "Excluir filas que son resúmenes de hallazgo (no son compras)",
         value=True,
@@ -418,54 +417,79 @@ def _renderizar_procesamiento(datos: pd.DataFrame, nombre_fuente: str) -> None:
     )
 
 
-def _renderizar_referencia_modelo_a() -> None:
-    """Estado y entrenamiento del modelo A con compras de referencia (CONOSCE)."""
-    guardado = gestor_modelo_referencia.modelo_referencia()
+_TEXTO_REFERENCIA = {
+    "A": ("el Isolation Forest del modelo A", "uploader_referencia"),
+    "B": ("el Isolation Forest del modelo B (ajuste de 0 a 20 puntos)", "uploader_referencia_b"),
+}
+# Parámetros de la configuración que cambian las variables del bosque del modelo B.
+_PARAMETROS_MODELO_B = (
+    ("contaminacion", "frecuencia_contaminacion", "contaminación"),
+    ("ventana_dias", "ventana_dias", "ventana"),
+    ("umbral_similitud_nlp", "umbral_similitud_nlp", "umbral de similitud"),
+    ("uit_vigente", "monto_uit_vigente", "UIT"),
+)
+
+
+def _renderizar_referencia(modelo: str) -> None:
+    """Estado y entrenamiento de un Isolation Forest con compras de referencia (OECE)."""
+    nombre, clave_uploader = _TEXTO_REFERENCIA[modelo]
+    guardado = gestor_modelo_referencia.modelo_referencia(modelo)
     if guardado is None:
         st.info(
-            "El modelo A no tiene compras de referencia: se entrenará con el propio archivo. "
-            "Entrénalo con compras del CONOSCE para que aprenda cómo luce una compra habitual."
+            f"{nombre[0].upper()}{nombre[1:]} no tiene compras de referencia: se entrenará con "
+            "el propio archivo. Entrénalo con compras del OECE para que aprenda cómo luce "
+            "una compra habitual."
         )
     else:
         st.success(
-            f"El modelo A usa un Isolation Forest entrenado con {guardado['compras']:,} compras "
+            f"{nombre[0].upper()}{nombre[1:]} está entrenado con {guardado['compras']:,} compras "
             f"de {guardado['entidades']:,} entidades ({', '.join(guardado['archivos'])}; "
             f"contaminación {guardado['contaminacion']}, {guardado['fecha']})."
         )
     if not tiene_permiso("cambiar_configuracion"):
         return
-    with st.expander("Entrenar el modelo A con compras de referencia"):
+    with st.expander(f"Entrenar {nombre} con compras de referencia"):
         st.caption(
             "Archivos sin etiqueta con muchas compras reales (p. ej., adjudicaciones del "
-            "CONOSCE). Reemplazan al modelo guardado; no se guardan como lotes."
+            "OECE). Reemplazan al modelo guardado; no se guardan como lotes."
+            + (" Se usan la ventana, la UIT y el umbral de similitud de la configuración actual."
+               if modelo == "B" else "")
         )
         archivos = st.file_uploader(
             "Archivos de referencia (.xlsx, .csv)",
             type=["xlsx", "csv"],
             accept_multiple_files=True,
-            key="uploader_referencia",
+            key=clave_uploader,
         )
         columnas = st.columns(2)
-        if columnas[0].button("Entrenar y guardar", disabled=not archivos):
+        if columnas[0].button("Entrenar y guardar", disabled=not archivos, key=f"entrenar_{modelo}"):
             try:
                 tablas = [
                     leer_csv_con_codificacion(a) if a.name.lower().endswith(".csv") else pd.read_excel(a)
                     for a in archivos
                 ]
-                contaminacion = _obtener_parametros_pipeline()["frecuencia_contaminacion"]
-                nuevo = gestor_modelo_referencia.entrenar_y_guardar(
-                    tablas, [a.name for a in archivos], contaminacion)
+                parametros = _obtener_parametros_pipeline()
+                with st.spinner("Entrenando con las compras de referencia..."):
+                    nuevo = gestor_modelo_referencia.entrenar_y_guardar(
+                        tablas,
+                        [a.name for a in archivos],
+                        parametros["frecuencia_contaminacion"],
+                        modelo,
+                        parametros["ventana_dias"],
+                        parametros["monto_uit_vigente"],
+                        parametros["umbral_similitud_nlp"],
+                    )
                 registrar_log(
                     st.session_state.get("id_usuario", 1),
-                    "Modelo A entrenado con referencia",
+                    f"Modelo {modelo} entrenado con referencia",
                     "Ingesta",
                     f"{nuevo['compras']} compras de {', '.join(nuevo['archivos'])}.",
                 )
                 st.rerun()
             except Exception as error:
-                st.error(f"No fue posible entrenar el modelo A: {error}")
-        if guardado is not None and columnas[1].button("Quitar la referencia"):
-            gestor_modelo_referencia.eliminar()
+                st.error(f"No fue posible entrenar el modelo {modelo}: {error}")
+        if guardado is not None and columnas[1].button("Quitar la referencia", key=f"quitar_{modelo}"):
+            gestor_modelo_referencia.eliminar(modelo)
             st.rerun()
 
 
@@ -534,9 +558,22 @@ def _procesar_fuente(datos: pd.DataFrame, nombre_fuente: str) -> None:
             progreso.progress(50)
 
             estado.text("3/4 · Evaluando patrones estadísticos")
+            guardado_b = gestor_modelo_referencia.modelo_referencia("B")
+            if guardado_b is not None:
+                distintos = [
+                    f"{texto} {guardado_b[clave]} (configuración actual: {parametros[clave_config]})"
+                    for clave, clave_config, texto in _PARAMETROS_MODELO_B
+                    if float(guardado_b[clave]) != float(parametros[clave_config])
+                ]
+                if distintos:
+                    st.warning(
+                        "El Isolation Forest del modelo B se entrenó con otra configuración: "
+                        + "; ".join(distintos) + ". Vuelve a entrenarlo para aplicar la actual."
+                    )
             resultados, _, _ = entrenar_y_evaluar_isolation_forest(
                 caracteristicas,
                 contaminacion=parametros["frecuencia_contaminacion"],
+                modelo=None if guardado_b is None else guardado_b["modelo"],
             )
             # Solo puntúa si un administrador activó un modelo que superó la
             # validación; si no, los resultados quedan exactamente como estaban.
@@ -548,6 +585,8 @@ def _procesar_fuente(datos: pd.DataFrame, nombre_fuente: str) -> None:
                     "cada motivo conserva el puntaje de reglas + ajuste como referencia."
                 )
             nombre_lote = nombre_fuente
+            if guardado_b is not None:
+                nombre_lote += f" · bosque de referencia ({guardado_b['compras']:,} compras)"
         progreso.progress(75)
 
         estado.text("4/4 · Guardando resultados y registrando trazabilidad")
@@ -703,12 +742,14 @@ def _persistir_resultados(
                         (id_convocatoria, id_modelo, similitud_nlp,
                          monto_acumulado_30d, frecuencia_compras_30d,
                          dias_desde_compra_anterior, score_reglas_negocio,
-                         bono_ia, puntaje_riesgo, nivel_riesgo, es_anomalia,
-                         explicacion_reglas, estado_revision, etiqueta_referencia)
+                         bono_ia, atipicidad_ia, puntaje_riesgo, nivel_riesgo,
+                         es_anomalia, explicacion_reglas, estado_revision,
+                         etiqueta_referencia)
                     VALUES
                         (:convocatoria, :modelo, :similitud, :acumulado,
-                         :frecuencia, :dias, :reglas, :bono, :puntaje, :nivel,
-                         :anomalia, :explicacion, :estado_revision, :etiqueta)
+                         :frecuencia, :dias, :reglas, :bono, :atipicidad,
+                         :puntaje, :nivel, :anomalia, :explicacion,
+                         :estado_revision, :etiqueta)
                     """
                 ),
                 {
@@ -728,6 +769,7 @@ def _persistir_resultados(
                         fila.get("score_reglas_negocio", 0.0)
                     ),
                     "bono": float(fila.get("bono_ia", 0.0)),
+                    "atipicidad": _atipicidad(fila),
                     "puntaje": puntaje,
                     "nivel": _nivel_riesgo(puntaje),
                     "anomalia": es_anomalia,
@@ -786,6 +828,11 @@ def _etiqueta_referencia(fila) -> int | None:
         texto = unicodedata.normalize("NFKD", str(valor or "")).encode("ascii", "ignore")
         return ETIQUETAS_TEXTO.get(texto.decode().strip().upper())
     return int(numero) if numero in (0.0, 1.0) else None
+
+
+def _atipicidad(fila) -> float | None:
+    valor = pd.to_numeric(fila.get("atipicidad_ia"), errors="coerce")
+    return None if pd.isna(valor) else float(valor)
 
 
 def _nivel_riesgo(puntaje: float) -> str:
